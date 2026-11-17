@@ -113,6 +113,9 @@ def main():
   if args.output_dir:
     config["runner"]["log_directory"] = str(args.output_dir)
   if args.data:
+    from supermimic.data.packaged import resolve_dataset
+
+    args.data = resolve_dataset(args.data)
     config["motion_file"] = str(args.data / "train/*.npz")
     config["runner"]["human_data_dir"] = str(args.data / "train")
   if args.smoke:

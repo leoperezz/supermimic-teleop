@@ -63,6 +63,12 @@ def main():
   )
   p.add_argument("--outage-seconds", type=float, default=0)
   args = p.parse_args()
+  from supermimic.data.packaged import resolve_dataset
+
+  if args.data.name in ("train", "validation"):
+    args.data = resolve_dataset(args.data.parent) / args.data.name
+  elif (args.data / "shards.json").is_file() or (args.data / "validation").is_dir():
+    args.data = resolve_dataset(args.data) / "validation"
   paths = sorted(args.data.glob("*.npz"))
   if args.steps < 0 or args.num_envs < 1 or not paths:
     p.error("steps >= 0, num-envs >= 1 and a nonempty dataset are required")

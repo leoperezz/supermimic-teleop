@@ -88,6 +88,9 @@ def main():
     "--strict", action="store_true", help="Exit nonzero on diagnostic warnings"
   )
   args = p.parse_args()
+  from supermimic.data.packaged import resolve_dataset
+
+  args.data = resolve_dataset(args.data)
   if (args.data / ".processing").exists():
     p.error("Preprocessing incomplete")
   paths = sorted(args.data.glob("train/*.npz")) + sorted(

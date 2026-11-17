@@ -81,6 +81,119 @@ alineamiento perfecto.
 Para incorporar el nuevo filtro inicial a un dataset anterior, regenerarlo en
 otro `--output`. No mezclar recetas. No entrenar mientras exista `.processing`.
 
+### Procesar el corpus completo
+
+`bin/preprocess_dataset.sh` usa por defecto `data/seed` como entrada, los scripts
+del checkout hermano `../GR00T-WholeBodyControl` y escribe en `data/seed-processed`.
+Para procesar todos los clips que encuentre, desactiva el límite con
+`--max-clips 0` y pasa `--include` sin palabras: así se aplica la lista negra
+oficial por nombre, pero no se limita a categorías como `walk` o `idle`.
+
+```bash
+# Ejecutar desde supermimic-teleop/, después de descargar y extraer los datos.
+bash bin/preprocess_dataset.sh \
+  --max-clips 0 --include \
+  --input data/seed \
+  --gr00t ../GR00T-WholeBodyControl \
+  --output data/seed-processed-full
+```
+
+El proceso busca CSV en `data/seed/g1/csv/` y el `.pkl` SMPL con el mismo
+nombre en `data/seed/smpl_filtered/`. Cada pareja se convierte a 50 Hz y pasa
+los filtros de nombre, duración, articulaciones, apoyo FK y calibración humana
+descritos arriba. Por eso “completo” significa que se recorren todos los
+candidatos elegibles; algunos se registran como rechazados o sin pareja, y no
+todos terminan en el conjunto aceptado. El comando muestra el resumen al final.
+Consulta `summary.json` para los conteos y `manifest.jsonl` para el estado y la
+razón de cada candidato que pasó el filtro de nombre. Los nombres excluidos se
+cuentan como `name_filter` en el resumen.
+
+El resultado contiene `train/`, `validation/`, `manifest.jsonl`,
+`summary.json` y `preprocess.json`. Usa un directorio nuevo para mantener la
+salida de un procesamiento anterior. Si el comando se interrumpe, no entrenes:
+vuelve a ejecutar el mismo comando para regenerar el corpus completo. El marcador
+`.processing` se elimina al terminar correctamente. La receta se guarda en
+`preprocess.json`; cambiar opciones requiere otro directorio de salida.
+
+Después, audita el corpus antes de entrenar:
+
+```bash
+uv run python -m supermimic.scripts.audit_dataset \
+  --data data/seed-processed-full --plots 24 --strict
+```
+
+El corpus completo puede ocupar mucho espacio y el entrenamiento carga datos en
+memoria del dispositivo. Confirma primero que tienes espacio suficiente y mide
+RAM/VRAM antes de lanzar entrenamiento a escala; si no caben, usa un subconjunto
+con `--max-clips` o categorías concretas con `--include walk idle jog`.
+
+### Subir los datos procesados a Hugging Face
+
+Para evitar el límite de archivos por directorio del Hub, empaqueta los NPZ ya
+procesados en archivos `.tar` de 1 000 clips, agrupados en carpetas de hasta 100 paquetes. **No vuelve a procesar los datos**:
+conserva los bytes y las rutas `train/` y `validation/` dentro de cada paquete.
+La salida ocupa aproximadamente otros 25 GB para este corpus; usa una carpeta
+nueva fuera del dataset de entrada.
+
+```bash
+python bin/package_dataset.py \
+  --input data/seed-processed-full \
+  --output data/seed-processed-full-hub
+
+hf upload NONHUMAN-RESEARCH/seed-processed-full \
+  ./data/seed-processed-full-hub . --repo-type dataset \
+  --exclude ".unpacked/**" --exclude ".cache/**"
+```
+
+Se suben `shards/*.tar`, un índice `shards.json` con conteos y SHA-256, los tres
+archivos de metadatos y un README con instrucciones de descarga. Si la subida
+se interrumpe, repite el comando `hf upload`. Los archivos sueltos de un intento
+anterior pueden seguir en el remoto; la descarga de abajo selecciona únicamente
+los paquetes y metadatos nuevos.
+
+El preprocesamiento ahora empaqueta automáticamente al terminar, en `<output>-hub`.
+Para empaquetar datos existentes sin ejecutar ninguna conversión:
+
+```bash
+bin/preprocess_dataset.sh --package-only --output data/seed-processed-full \
+  --hub-output data/seed-processed-full-hub-nuevo
+```
+
+`--clips-per-shard` controla el número de clips por paquete. El destino debe ser
+nuevo para evitar mezclar versiones. Entrenamiento y auditoría aceptan la raíz
+del paquete mediante `--data`; evaluación acepta esa raíz (elige validation)
+o su ruta `validation/`. En el primer uso se comprueban SHA-256 y conteos y se
+extraen ambos splits en `.unpacked/`; los siguientes usos reutilizan esa copia.
+Se necesita espacio adicional para los NPZ extraídos. Por ejemplo:
+
+```bash
+bin/train.sh --data data/seed-processed-full-hub
+uv run python -m supermimic.scripts.evaluate_human \
+  --checkpoint logs/my-run --data data/seed-processed-full-hub/validation
+```
+
+Para usarlo en otra máquina, descarga y extrae los paquetes (no requiere
+reprocesamiento). Ejecuta desde `supermimic-teleop/`:
+
+```bash
+hf download NONHUMAN-RESEARCH/seed-processed-full --repo-type dataset \
+  --include 'shards/*' --include 'shards.json' --include 'manifest.jsonl' \
+  --include 'preprocess.json' --include 'summary.json' \
+  --local-dir data/seed-processed-full-download
+
+mkdir -p data/seed-processed-full
+for shard in data/seed-processed-full-download/shards/*/*/*.tar; do
+  tar -xf "$shard" -C data/seed-processed-full
+done
+cp data/seed-processed-full-download/{manifest.jsonl,preprocess.json,summary.json} \
+  data/seed-processed-full/
+```
+
+Tras extraer, los comandos de entrenamiento y auditoría usan
+`--data data/seed-processed-full` como con el dataset original. Las rutas de
+origen guardadas en el manifest y la receta describen la máquina que procesó
+los datos y se mantienen como procedencia.
+
 ## 2. Verificar el recorrido con una prueba pequeña
 
 Estos comandos prueban preparación, baseline, carga, adaptación y exportación.
@@ -267,17 +380,9 @@ Para ajustar recursos, usar por ejemplo `--set num_envs=16
 se pueden activar con `--set` tras verificar una ejecución pequeña. Cambiar las
 capas del actor/WM o el historial exige un baseline compatible.
 
-Para procesar todo el corpus:
-
-```bash
-bash bin/preprocess_dataset.sh --max-clips 0 --include \
-  --output data/seed-processed-full
-```
-
 El loader actual carga las referencias y tablas humanas en memoria del
-dispositivo. **No lanzar todo el corpus a entrenamiento sin medir RAM/VRAM**;
-escalar primero por subconjuntos procesados. Este cambio no implementa shards.
-La selección walk/idle/jog inicial no acredita generalización a todo el cuerpo.
+dispositivo. Este cambio no implementa shards. La selección walk/idle/jog
+inicial no acredita generalización a todo el cuerpo.
 
 Para reproducir el bootstrap conjunto experimental anterior:
 
