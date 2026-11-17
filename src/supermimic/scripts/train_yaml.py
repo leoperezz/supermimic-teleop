@@ -88,6 +88,22 @@ def apply_stage(config, stage, distillation, checkpoint=None):
   )
 
 
+def configure_wandb_environment(runtime):
+  """Configure the destination before importing W&B or resolving credentials."""
+  # Environment > .env.local > .env > recipe. Never print secrets.
+  for filename in [".env.local", ".env"]:
+    for key, value in dotenv_values(filename).items():
+      if value and not os.environ.get(key):
+        os.environ[key] = value
+  for key, value in {
+    "WANDB_MODE": runtime.get("wandb_mode", "online"),
+    "WANDB_ENTITY": runtime.get("wandb_entity"),
+    "WANDB_BASE_URL": runtime.get("wandb_base_url"),
+  }.items():
+    if value and not os.environ.get(key):
+      os.environ[key] = str(value)
+
+
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--config", type=Path, default=Path("configs/train.yaml"))
@@ -154,29 +170,35 @@ def main():
     return
   recipe = copy.deepcopy(config)
   runtime = config.pop("runtime", {})
-  allowed_runtime = {"compile", "cuda_graphs", "seed", "wandb_mode", "wandb_entity"}
+  allowed_runtime = {
+    "compile",
+    "cuda_graphs",
+    "seed",
+    "wandb_mode",
+    "wandb_entity",
+    "wandb_base_url",
+  }
   if set(runtime) - allowed_runtime:
     raise ValueError(f"Unknown runtime keys: {set(runtime) - allowed_runtime}")
   os.environ["TORCHDYNAMO_DISABLE"] = "0" if runtime.get("compile", True) else "1"
   os.environ["SUPERMIMIC_CUDA_GRAPHS"] = (
     "1" if runtime.get("cuda_graphs", True) else "0"
   )
-  # Environment > .env.local > .env. Never source shell code or print secrets.
-  for filename in [".env.local", ".env"]:
-    for key, value in dotenv_values(filename).items():
-      if value and not os.environ.get(key):
-        os.environ[key] = value
-  mode = str(runtime.get("wandb_mode", "online"))
-  os.environ["WANDB_MODE"] = os.environ.get("WANDB_MODE") or mode
-  if runtime.get("wandb_entity"):
-    os.environ["WANDB_ENTITY"] = runtime["wandb_entity"]
-  import torch
+  configure_wandb_environment(runtime)
   import wandb
 
-  if os.environ["WANDB_MODE"] == "online" and not wandb.api.api_key:
-    print("[INFO] W&B sin credenciales: guardando offline; usa wandb sync después.")
-    os.environ["WANDB_MODE"] = "offline"
-  recipe.setdefault("runtime", {})["wandb_mode"] = os.environ["WANDB_MODE"]
+  if os.environ["WANDB_MODE"] == "online" and not wandb.login(prompt=False):
+    host = os.environ.get("WANDB_BASE_URL", wandb.Settings().base_url)
+    raise RuntimeError(
+      f"W&B online requiere credenciales: ejecuta uv run wandb login --host {host} "
+      "o configura WANDB_API_KEY en .env.local. "
+      "Para pruebas locales usa WANDB_MODE=offline explícitamente."
+    )
+  for key in ("wandb_mode", "wandb_entity", "wandb_base_url"):
+    if value := os.environ.get(key.upper()):
+      recipe.setdefault("runtime", {})[key] = value
+  import torch
+
   seed = runtime.get("seed", 42)
   random.seed(seed)
   np.random.seed(seed)

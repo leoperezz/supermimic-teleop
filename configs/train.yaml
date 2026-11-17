@@ -9,8 +9,9 @@ runtime:
   seed: 42
   compile: false  # Opt in for longer runs after measuring compilation cost.
   cuda_graphs: false
-  wandb_mode: online  # Without login/API key, explicitly falls back to offline.
-  wandb_entity: null
+  wandb_mode: online  # Requires credentials; use offline explicitly for local tests.
+  wandb_entity: mu-robotics
+  wandb_base_url: https://api.forge.coreweave.com
 runner:
   wandb_project: supermimic-teleop
   run_name: seed-motion-baseline

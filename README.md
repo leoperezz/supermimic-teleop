@@ -33,6 +33,17 @@ para los datos y acceso aceptado a BONES-SEED en Hugging Face. El instalador
 prepara Python 3.13 y las dependencias; el preprocesador reutiliza los scripts
 del checkout local de GR00T.
 
+En Linux x86_64 se fija PyTorch 2.14.x desde el índice CUDA 12.6 y Warp
+1.19.0 desde el wheel oficial `+cu12`. Esto permite usar el driver 570.207
+de Razorcrest sin que una sincronización seleccione binarios de CUDA 13.
+No hace falta instalar otro CUDA Toolkit del sistema: `uv sync --locked`
+instala las dependencias del entorno. PyTorch y Warp deben poder ejecutar
+en GPU antes de iniciar el entrenamiento:
+
+```bash
+uv run python -c 'import torch, warp as wp; print(torch.__version__, torch.version.cuda); print(torch.ones(1, device="cuda")); wp.init(); print(wp.zeros(1, device="cuda:0").numpy())'
+```
+
 ```bash
 bash bin/install.sh
 # Si los datos ya están descargados en data/seed, omitir este paso.
@@ -44,9 +55,31 @@ export MUJOCO_GL=egl
 ```
 
 El descargador lee `HF_TOKEN` del entorno, `.env.local` o `.env`, en ese orden.
-El entrenamiento admite las mismas fuentes para `WANDB_API_KEY`. Para publicar
-métricas, configurar credenciales y `WANDB_MODE=online`; las pruebas offline se
-pueden subir posteriormente con `uv run wandb sync RUTA_DEL_RUN_OFFLINE`.
+El entrenamiento admite las mismas fuentes para `WANDB_API_KEY`. La receta
+envía los runs a [mu-robotics/supermimic-teleop en Forge](https://forge.coreweave.com/wandb/mu-robotics/supermimic-teleop),
+usando `https://api.forge.coreweave.com` como API. En modo online, si faltan
+credenciales el entrenamiento se detiene antes de crear el simulador.
+El proyecto requiere W&B SDK 0.31.x, con soporte nativo para Forge; `uv sync`
+actualiza instalaciones anteriores que pueden fallar durante el login.
+Entorno > `.env.local` > `.env` > receta para `WANDB_MODE`, `WANDB_ENTITY` y
+`WANDB_BASE_URL`. Las pruebas offline se pueden subir posteriormente con
+`WANDB_BASE_URL=https://api.forge.coreweave.com uv run wandb sync --entity mu-robotics --project supermimic-teleop RUTA_DEL_RUN_OFFLINE`.
+
+Para iniciar el baseline con el dataset completo ya descargado:
+
+```bash
+# Una sola vez, si todavía no configuraste WANDB_API_KEY para Forge.
+uv run wandb login --host https://api.forge.coreweave.com
+
+WANDB_MODE=online bash bin/train.sh --stage baseline \
+  --data data/seed-processed-full \
+  --output-dir "logs/seed-motion-baseline-$(date +%Y%m%d-%H%M%S)"
+```
+
+El lector extrae automáticamente los shards descargados en `.unpacked/` en
+el primer uso; no hace falta volver a preprocesarlos. Este comando usa 32
+entornos, GPU `cuda:0` y 10 000 iteraciones. Después se evalúa el baseline y
+se usa su checkpoint para la adaptación humana (secciones 3–4).
 
 Preparar primero un subconjunto manejable y reproducible:
 
