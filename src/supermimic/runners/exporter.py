@@ -38,6 +38,7 @@ def _export_onnx(
   input_names: list[str],
   output_names: list[str],
   path: str,
+  dynamic_axes: dict | None = None,
 ) -> None:
   # Export a CPU copy; captured training updates read the live parameters by address.
   module = copy.deepcopy(module).cpu().eval()
@@ -49,7 +50,7 @@ def _export_onnx(
     opset_version=18,
     input_names=input_names,
     output_names=output_names,
-    dynamic_axes={},
+    dynamic_axes=dynamic_axes or {},
     dynamo=False,
   )
 
@@ -61,11 +62,14 @@ def _export_module(
   output_names: list[str],
   path: str,
   filename: str,
+  dynamic_axes: dict | None = None,
 ) -> str:
   """makedirs + ONNX export; returns the written path."""
   os.makedirs(path, exist_ok=True)
   onnx_path = os.path.join(path, filename)
-  _export_onnx(module, sample_inputs, input_names, output_names, onnx_path)
+  _export_onnx(
+    module, sample_inputs, input_names, output_names, onnx_path, dynamic_axes
+  )
   return onnx_path
 
 
@@ -319,3 +323,34 @@ def export_actor_as_onnx(
   if replay is not None:
     written.append(replay)
   return written
+
+
+class HumanActor(nn.Module):
+  """Deployment-only human encoder + shared decoder; no clip, FK or dynamics."""
+
+  def __init__(self, actor: MultiEncoderAE):
+    super().__init__()
+    self.encoder = actor.encoders["human_body"]
+    self.goal_normalizer = actor.goal_normalizers["human_body"]
+    self.obs_normalizer = actor.obs_normalizer
+    self.decoder = actor.decoder
+
+  def forward(self, goal_human: torch.Tensor, history_robot: torch.Tensor):
+    z = torch.tanh(self.encoder(self.goal_normalizer(goal_human)))
+    history = self.obs_normalizer(history_robot).flatten(1)
+    return self.decoder(torch.cat([z, history], dim=-1))
+
+
+def export_human_actor(actor: MultiEncoderAE, path: str) -> str:
+  """Export the 1360 + original robot history -> 29 contract for either obs mode."""
+  return _export_module(
+    HumanActor(actor),
+    (torch.zeros(1, 1360), torch.zeros(1, actor.history_length, actor.obs_dim)),
+    ["goal_human", "history_robot"],
+    ["actions"],
+    path,
+    "policy_human_body.onnx",
+    dynamic_axes={
+      name: {0: "batch"} for name in ["goal_human", "history_robot", "actions"]
+    },
+  )

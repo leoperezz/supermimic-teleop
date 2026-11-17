@@ -76,6 +76,8 @@ def log_model_artifact(
     for path in files:
       artifact.add_file(path)
     wandb.run.log_artifact(artifact)
+    if wandb.run.settings.mode == "offline":
+      return
     collection = f"{wandb.run.entity}/{wandb.run.project}/model-{wandb.run.id}"
     versions = sorted(wandb.Api().artifacts("model", collection), key=_version_index)
     for stale in versions[:-keep_last]:

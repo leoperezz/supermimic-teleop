@@ -142,6 +142,10 @@ class MultiEncoderAE(nn.Module):
     # encoder against the anchor encoder on the same state.
     self._anchor = self._task_names[0]
     self._aux_loss = torch.zeros(0)
+    self.human_adaptation = False
+    self.action_bc_weight = 0.0
+    # Mutable scalar so a decay schedule also works inside captured CUDA graphs.
+    self.register_buffer("bc_scale", torch.tensor(1.0), persistent=False)
 
     self.obs_normalizer = _CudaGraphNormalization(obs_dim)
     self.goal_normalizers = nn.ModuleDict(
@@ -173,6 +177,14 @@ class MultiEncoderAE(nn.Module):
     if abs(total - 1.0) > 1e-6:
       raise ValueError(f"slot_mix must sum to 1.0; got {total}")
     self._slot_fractions = fractions
+
+  def freeze_for_human_adaptation(self) -> None:
+    """Preserve original motion actions, including all shared statistics."""
+    if "human_body" not in self.encoders:
+      raise ValueError("Human adaptation requires a human_body encoder")
+    self.requires_grad_(False)
+    self.encoders["human_body"].requires_grad_(True)
+    self.human_adaptation = True
 
   def slot_ranges(self, batch_size: int) -> list[tuple[int, int]]:
     """Contiguous ``(lo, hi)`` per task at the given batch size; last absorbs remainder."""
@@ -206,15 +218,17 @@ class MultiEncoderAE(nn.Module):
     """Per-env BC loss pulling each non-anchor encoder's latent toward the
     anchor encoder's latent on the same state.
 
-    Goals are detached before the BC encoder forwards so BC's gradient only
-    updates the non-anchor encoder's parameters — never the decoder or the
-    anchor encoder.
+    Goals are detached before the BC encoder forwards. Latent BC only updates
+    the non-anchor encoder. Action BC also updates the decoder in joint training;
+    adaptation freezes the decoder explicitly. The anchor query has no gradient.
 
     Anchor query is also under ``no_grad``. Skipped in eval mode.
     Returns ``(num_envs,)``; anchor / empty slots contribute zero.
     """
     out = torch.zeros(obs_td.shape[0], device=obs_td.device)
-    if not self.training or self.latent_bc_weight == 0.0:
+    if not self.training or (
+      self.latent_bc_weight == 0.0 and self.action_bc_weight == 0.0
+    ):
       return out
     anchor = self._anchor
     anchor_goal_d = self.goal_normalizers[anchor](obs_td[f"goal_{anchor}"]).detach()
@@ -226,7 +240,13 @@ class MultiEncoderAE(nn.Module):
       with torch.no_grad():
         z_anchor = torch.tanh(self.encoders[anchor](anchor_goal_d[lo:hi]))
       out[lo:hi] = self.latent_bc_weight * ((z - z_anchor) ** 2).mean(dim=-1)
-    return out
+      if self.action_bc_weight:
+        history = self.obs_normalizer(obs_td["history"][lo:hi]).flatten(1).detach()
+        student = self.decoder(torch.cat([z, history], dim=-1))
+        with torch.no_grad():
+          teacher = self.decoder(torch.cat([z_anchor, history], dim=-1))
+        out[lo:hi] += self.action_bc_weight * (student - teacher).square().mean(-1)
+    return out * self.bc_scale
 
   def auxiliary_loss(self) -> torch.Tensor:
     return self._aux_loss
@@ -239,10 +259,13 @@ class MultiEncoderAE(nn.Module):
   @torch.jit.unused
   def update_normalization(self, obs_td: TensorDict) -> None:
     obs = obs_td["history"][:, -1]
-    self.obs_normalizer.update(obs)
+    if not self.human_adaptation:
+      self.obs_normalizer.update(obs)
     for name, (lo, hi) in zip(
       self._task_names, self.slot_ranges(obs.shape[0]), strict=True
     ):
       if lo == hi:
+        continue
+      if self.human_adaptation and name != "human_body":
         continue
       self.goal_normalizers[name].update(obs_td[f"goal_{name}"][lo:hi])

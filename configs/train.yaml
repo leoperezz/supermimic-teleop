@@ -1,0 +1,57 @@
+# Local training recipe. Override any key with bin/train.sh --set key=value.
+# --smoke runs 8 iterations with small networks and batches on the real dataset.
+task: SuperMimic-GenCoord-G1
+num_envs: 32
+device: cuda:0
+registry_name: null
+motion_file: data/seed-processed/train/*.npz
+runtime:
+  seed: 42
+  compile: false  # Opt in for longer runs after measuring compilation cost.
+  cuda_graphs: false
+  wandb_mode: online  # Without login/API key, explicitly falls back to offline.
+  wandb_entity: null
+runner:
+  wandb_project: supermimic-teleop
+  run_name: seed-motion-baseline
+  max_iterations: 10000
+  buffer_size: 512
+  log_interval: 10
+  save_interval: 500
+  representation: gencoord
+  actor_obs: rep_state
+  history_length: 1
+  latent_dim: 32
+  actor_hidden_dims: [2048, 1024, 512, 256]
+  dynamics_hidden_dims: [2048, 2048, 2048]
+  critic_hidden_dims: [256, 128]
+  sampling_mode: uniform
+  replay_ratio: 4
+  # train.sh defaults to baseline. --stage adaptation selects only human slots.
+  # --distillation off|fixed|decay selects the auxiliary loss schedule.
+  checkpoint_dir: null
+  human_adaptation: false
+  human_data_dir: data/seed-processed/train
+  human_position_noise: 0.005
+  human_dropout_probability: 0.02
+  human_max_dropout_frames: 4
+  export_human: true
+  latent_bc_weight: 0.0
+  action_bc_weight: 0.0
+  bc_decay_iterations: 0
+  tasks:
+    human_body: false
+  slot_mix: {motion: 1.0, velocity: 0.0}
+  wm:
+    lr: 0.0002
+    num_batches: 1
+    batch_size: 64
+    horizon: 8
+  policy:
+    lr: 0.0002
+    num_batches: 1
+    batch_size: 64
+    horizon: 16
+    noise: 0.1
+    gamma: 0.99
+    lam: 0.95

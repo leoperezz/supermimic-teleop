@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from collections.abc import Callable, Iterable, Sequence
 
 import torch
@@ -25,11 +26,18 @@ def build_optimizers(
     for seq in module.modules()
     if isinstance(seq, nn.Sequential)
     for linear in [m for m in seq if isinstance(m, nn.Linear)][1:-1]
+    if linear.weight.requires_grad
   ]
   hidden_ids = {id(p) for p in hidden}
-  rest = [p for m in modules for p in m.parameters() if id(p) not in hidden_ids]
+  rest = [
+    p
+    for m in modules
+    for p in m.parameters()
+    if p.requires_grad and id(p) not in hidden_ids
+  ]
+  cuda = torch.device(device).type == "cuda"
   adam = torch.optim.Adam(
-    rest, lr=torch.tensor(lr, device=device), betas=betas, fused=True, capturable=True
+    rest, lr=torch.tensor(lr, device=device), betas=betas, fused=cuda, capturable=cuda
   )
   if not hidden:
     return [adam]
@@ -109,7 +117,7 @@ class CapturedUpdate:
 
   def __call__(self, inputs: TensorDict) -> dict[str, torch.Tensor]:
     state = self._state()
-    if not state[0].is_cuda:
+    if not state[0].is_cuda or os.environ.get("SUPERMIMIC_CUDA_GRAPHS") == "0":
       return self._fn(inputs)
     with torch.cuda.device(state[0].device):
       stream, pool = _capture_stream_and_pool(state[0].device)

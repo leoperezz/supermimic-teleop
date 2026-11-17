@@ -17,6 +17,7 @@ import torch
 from mjlab.utils.lab_api.math import quat_apply_inverse
 from tensordict import TensorDict
 
+from supermimic.data.human import GOAL_DIM
 from supermimic.representations import actor_goal_dim
 
 if TYPE_CHECKING:
@@ -197,6 +198,7 @@ class TasksCfg:
   """Per-task hyperparameters. Field order defines slot block ordering."""
 
   velocity: VelocityTaskCfg = field(default_factory=VelocityTaskCfg)
+  human_body: bool = False
 
 
 def resolve_task_specs(
@@ -205,7 +207,7 @@ def resolve_task_specs(
   num_goals: int,
   device: str = "cpu",
 ) -> list[TaskSpec]:
-  return [
+  specs = [
     make_motion_task(representation, num_goals),
     make_velocity_task(
       tasks.velocity.lin_vel_x_range,
@@ -216,3 +218,16 @@ def resolve_task_specs(
       device,
     ),
   ]
+  if tasks.human_body:
+    specs.append(
+      TaskSpec(
+        name="human_body",
+        goal_dim=GOAL_DIM,
+        extract_training_goal=lambda motion, times, aux: motion.human_table.extract(
+          times, aux[:, 3:7]
+        ),
+        build_inference_goal_obs=lambda raw: raw,
+        raw_goal_dim=GOAL_DIM,
+      )
+    )
+  return specs

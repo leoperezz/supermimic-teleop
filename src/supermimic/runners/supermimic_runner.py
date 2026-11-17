@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
+import os
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, cast
 
 import torch
 import torch.nn as nn
@@ -14,6 +16,7 @@ import wandb
 from rsl_rl.models import MLPModel
 from tensordict import TensorDict
 
+from supermimic.data.human import HumanMotionTable
 from supermimic.envs.motion_tracking_env import MotionTrackingEnv
 from supermimic.envs.multi_task_world_model_env import MultiTaskWorldModelEnv
 from supermimic.learners.policy_learner import (
@@ -69,6 +72,17 @@ ActorCriticCfg = Annotated[
 
 @dataclass
 class SuperMimicRunnerCfg(BaseRunnerCfg):
+  experiment_config: dict = field(default_factory=dict)
+  human_data_dir: str | None = None
+  human_position_noise: float = 0.005
+  human_dropout_probability: float = 0.02
+  human_max_dropout_frames: int = 4
+  checkpoint_dir: str | None = None
+  log_directory: str | None = None
+  human_adaptation: bool = False
+  action_bc_weight: float = 0.0
+  bc_decay_iterations: int = 0  # 0 = constant; otherwise linear 1 -> 0.
+  export_human: bool = True
   max_iterations: int = 1000000
   replay_ratio: int = 16
   latent_dim: int = 32
@@ -456,6 +470,11 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     raise NotImplementedError
 
   def _create_log_dir(self, *extra_parts: str) -> Path:
+    if self.cfg.log_directory:
+      log_dir = Path(self.cfg.log_directory)
+      log_dir.mkdir(parents=True, exist_ok=False)
+      print(f"[INFO] Logging to {log_dir}")
+      return log_dir
     """Create and return a timestamped log directory."""
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_dir = Path("logs", self.task_id, *extra_parts, timestamp)
@@ -475,6 +494,10 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       project=self.cfg.wandb_project,
       name=self.cfg.run_name or default_name,
       config=wandb_config,
+      mode=cast(
+        Literal["online", "offline", "disabled", "shared"],
+        os.environ.get("WANDB_MODE", "online"),
+      ),
     )
 
     if self.registry_name:
@@ -504,9 +527,60 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
   """
 
   def _init_policy(self) -> None:
+    if self.cfg.tasks.human_body:
+      if not self.cfg.human_data_dir:
+        raise ValueError("human_body requires human_data_dir")
+      self.motion.human_table = HumanMotionTable(
+        self.motion,
+        self.cfg.human_data_dir,
+        self.device,
+        noise_std=self.cfg.human_position_noise,
+        dropout_prob=self.cfg.human_dropout_probability,
+        max_dropout=self.cfg.human_max_dropout_frames,
+        seed=self.cfg.experiment_config.get("runtime", {}).get("seed", 42),
+      )
     actor = build_actor(self.cfg, self._wm, self.device)
+    actor.action_bc_weight = self.cfg.action_bc_weight
+    if self.cfg.checkpoint_dir:
+      checkpoint = Path(self.cfg.checkpoint_dir)
+      config_path = checkpoint / "runner_config.json"
+      if config_path.exists():
+        original_cfg = json.loads(config_path.read_text())
+        for key in [
+          "representation",
+          "actor_obs",
+          "history_length",
+          "latent_dim",
+          "actor_hidden_dims",
+          "dynamics_hidden_dims",
+        ]:
+          value = getattr(self.cfg, key)
+          if original_cfg[key] != (list(value) if isinstance(value, tuple) else value):
+            raise ValueError(f"Checkpoint {key} differs from training config")
+      self._wm.load_bundle(
+        torch.load(
+          checkpoint / "world_model.pt", map_location=self.device, weights_only=True
+        )
+      )
+      state = torch.load(
+        checkpoint / "actor.pt", map_location=self.device, weights_only=True
+      )
+      missing, unexpected = actor.load_state_dict(state, strict=False)
+      if unexpected or any(
+        not k.startswith(("encoders.human_body.", "goal_normalizers.human_body."))
+        for k in missing
+      ):
+        raise ValueError(
+          f"Incompatible checkpoint: missing={missing}, unexpected={unexpected}"
+        )
+    if self.cfg.human_adaptation:
+      if not self.cfg.checkpoint_dir:
+        raise ValueError("human_adaptation requires a trained checkpoint_dir")
+      actor.freeze_for_human_adaptation()
     self._active_task_specs = [
-      ts for ts in actor.task_specs if self.cfg.slot_mix.get(ts.name, 0.0) > 0.0
+      ts
+      for ts in actor.task_specs
+      if ts.name == "motion" or self.cfg.slot_mix.get(ts.name, 0.0) > 0.0
     ]
 
     print("[INFO] Sim slot ranges:")
@@ -520,6 +594,16 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       self.cfg.critic_hidden_dims,
       output_dim=1,
     ).to(self.device)
+    if (
+      self.cfg.checkpoint_dir and (Path(self.cfg.checkpoint_dir) / "critic.pt").exists()
+    ):
+      critic.load_state_dict(
+        torch.load(
+          Path(self.cfg.checkpoint_dir) / "critic.pt",
+          map_location=self.device,
+          weights_only=True,
+        )
+      )
 
     policy_cfg = self.cfg.policy
 
@@ -654,6 +738,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
   def run(self) -> None:
     log_dir = self._create_log_dir()
     self._init_wandb(log_dir)
+    (log_dir / "runner_config.json").write_text(json.dumps(asdict(self.cfg), indent=2))
 
     self.env.reset()
     self._seed_sim_history()
@@ -678,6 +763,10 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     upload: Future | None = None
 
     for step in range(self.cfg.max_iterations):
+      decay = self.cfg.bc_decay_iterations
+      bc_scale = max(0.0, 1.0 - step / decay) if decay else 1.0
+      self.policy_learner.actor.bc_scale.fill_(bc_scale)
+      loss_dict["Policy/bc_scale"] = self.policy_learner.actor.bc_scale.detach()
       num_collected_steps += self.step()
 
       for _ in range(should_train(step)):
@@ -721,7 +810,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         policy_learn_time = 0
         num_collected_steps = 0
 
-      if step % self.cfg.save_interval == 0:
+      if step % self.cfg.save_interval == 0 or step == self.cfg.max_iterations - 1:
         assert wandb.run is not None  # _init_wandb ran before the loop
         # The previous version must be logged before its files are overwritten.
         if upload is not None:
@@ -731,6 +820,13 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         torch.save(self._wm.bundle(), world_model_path)
         torch.save(self.policy_learner.actor.state_dict(), actor_path)
         checkpoint_files = [world_model_path, actor_path]
+        checkpoint_files.append(str(log_dir / "runner_config.json"))
+        if self.cfg.tasks.human_body and self.cfg.export_human:
+          from supermimic.runners.exporter import export_human_actor
+
+          checkpoint_files.append(
+            export_human_actor(self.policy_learner.actor, str(log_dir))
+          )
         critic = getattr(self.policy_learner, "critic", None)
         if critic is not None:
           critic_path = str(log_dir / "critic.pt")

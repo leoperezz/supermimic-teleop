@@ -11,8 +11,15 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.13,<3.14"
 dependencies = [
+    "joblib>=1.6.0",
+    "matplotlib>=3.10.8",
     "mjlab",
+    "onnxruntime>=1.32.0",
+    "pandas>=3.1.1",
+    "python-dotenv>=1.2.4",
+    "pyyaml>=6.0.3",
     "ruff>=0.14.10",
+    "scipy>=1.17.0",
     "viser>=1.0.24",
 ]
 

@@ -71,7 +71,7 @@ class BpttPolicyLearner:
     self.actor = policy
     self.wm_env = wm_env
     self.cfg = cfg
-    self.actor_params = list(self.actor.parameters())
+    self.actor_params = [p for p in self.actor.parameters() if p.requires_grad]
     self.actor_optimizers = build_optimizers(
       [self.actor], self.cfg.lr, betas=(0.9, self.cfg.beta2), device=device
     )
